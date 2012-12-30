@@ -1,1 +1,281 @@
-f 
+//选举(快速选举)
+namespace LEADER_ELECTION;
+
+var id;       //节点的唯一标识
+var history; //transaction日志，记录<zxid,value>
+var round = 0; //节点选举的次数
+var lastZxid; //历史记录中最大的Zxid
+var acceptedZxid; //节点目前接收到的最大Zxid
+var lastEpoch; //历史记录里最后的leader instance
+var acceptedEpoch;  //目前接收到的leader instance
+var quorum  ;  //节点中的多数派大小
+var ack_queue; //节点的消息回收队列
+var timeout;   //等待超时
+var state;
+var lastCommitZxid; //最近一次提交的zxid
+var lastSnapshotZxid; //最近一次快照的zxid
+var leader;//   leader id
+var followers;// all followers
+var mergerData ; //将Transaction Log 和最新快照数据合并再一起的组合数据包
+
+set Peer as p;
+BEGIN_INIT:
+  p.acceptedZxid = p.lastZxid = Last(p.history);
+	p.acceptedEpoch = p.lastEpoch = Epoch(p.lastZid);
+END
+
+//向集群发送一轮选举，永远推荐自己为leader
+BEGIN_LOOKING:
+	p.state = LOOKING;
+	p.round = p.round +1;
+	p.ack_queue = [];
+	clear all Timeout();
+	set Timeout(LOOKING,T0);
+	send VOTE(p.id, p.round, p.acceptedZxid) to all peers;
+END	
+
+//接收到其他节点发来的选票
+BEGIN_RECEIVE_VOTE:
+	receive VOTE(id,round,zxid) from one peer
+	if {p.acceptedZxid,p.id} >= {zxid,id}
+		//不关心状态，正常发送
+		send ACK_VOTE(p.id, round, p.acceptedZxid)
+	else
+		p.acceptedZxid = zxid;
+		if p.state != FOLLOWING
+			clear all Timeout();
+			set Timeout(FOLLOWING,T1);
+			p.state = FOLLOWING 
+		send ACK_VOTE(p.id, round, p.acceptedZxid)
+		
+END
+
+
+//接收到其他节点对自己本轮选票的回复
+BEGIN_RECEIVE_ACK_VOTE:
+	receive ACK_VOTE(id,round,zxid)
+	if round = p.round
+		if {p.acceptedZxid,p.id} >= {zxid,id}
+			if p.state == LOOKING //只有LOOKING状态，ACK队列才有意义
+				p.ack_queue.add(id,zxid);
+				if p.ack_queue.size >= quorum
+					p.ack_queue = []; //清空，准备接收follower的ack信息
+					p.state = LEADING;
+					clear all Timeout();
+					set Timeout(LEADING,T2);
+					send PUBLIC_LEADER(p.id,p.acceptedZxid,p.round, p.acceptedEpoch+1) to all peers
+		else if(p.state != FOLLOWING)
+			clear all Timeout();
+			set Timeout(FOLLOWING,T1);
+			p.state = FOLLOWING;
+			p.acceptedZxid = zxid
+				
+END
+
+//已经选出一个leader，向其他节点发送广播通知
+BEGIN_RECEIVE_PUBLIC_LEADER:
+	receive PUBLIC_LEADER(id,zxid, round,newEpoch)
+		Validate(p.acceptedZxid,newEpoch,zxid);
+		if {zxid,id} > {p.acceptedZxid,p.id}
+			p.leader = id;
+			p.acceptedEpoch = newEpoch;
+			if p.state != FOLLOWING
+				clear all Timeout();
+				set Timeout(FOLLOWING,T1);			
+				p.state = FOLLOWING
+			send ACK_PUBLIC_LEADER(p.id ,p.acceptedZxid, round)						
+		else
+			send ACK_PUBLIC_LEADER(p.id ,p.acceptedZxid,round)
+END
+
+//接收集群对leader的确认反馈
+BEGIN_RECEIVE_ACK_PUBLIC_LEADER:
+	receive ACK_PUBLIC_LEADER(id ,zxid,round)
+	if round = p.round
+		if	{zxid,id} > {p.acceptedZxid,p.id}
+			p.acceptedZxid = zxid;
+			clear all Timeout();
+			set Timeout(FOLLOWING,T1);				
+			p.state = FOLLOWING
+		else //此时节点的状态可能已经不是LEADING		
+			//通过判断state是LEADING，保证ack_queue是ACK_PUBLIC_LEADER,	而非ACK_VOTE
+			if p.state == LEADING  
+				p.ack_queue.add(id,zxid);
+				if	p.ack_queue.size >= quorum
+					send COMMIT_LEADER(p.id，p.acceptedZxid);
+					STOP ELECTION PROCESS
+			else //说明又加入了一个zxid更高的节点，或者PUBLIC_LEADER超时进入重选选举
+				(do nothing)
+			
+			
+END
+
+//最终提交leader，结束选举进程
+BEGIN_RECEIVE_COMMIT_LEADER:
+	receive COMMIT_LEADER(id, zxid)
+		STOP ELECTION PROCESS
+END
+
+BEGIN_TIMEOUT:
+	while trigger Timeout(FOLLOWING,T1) || Timeout(LEADING,T2) ||Timeout(LOOKING,T0)
+		goto BEGIN_LOOKING
+END
+
+
+从快速选举的伪代码可以看出以下几个特点
+1，在一轮选举中，一个节点状态由LOOKING变为FOLLOWING后，它有可能会变为LOOKING，但基本不会变为LEADING。
+2，在一轮选举中，一个节点状态由LOOKING变为LEADING后，它存在变为FOLLOWING和LOOKING的两种可能。
+3，节点状态切换后，要取消之前在状态上的所有超时，然后再设置一次新的超时。
+
+
+//注册
+namespace FOLLOWINFO;
+
+Set Follower as f;
+Set Leader as l;
+
+//code follower
+BEGIN_REISTER:
+f.updated = false;
+send FOLLOWINFO(f.id, f.lastZxid, f.lastCommitZxid) to l;
+receive SYNC message;//接收同步数据。
+goto RECOVEY.follower.BEGIN_SYNC
+END
+
+//code leader
+//leader一定是可用集群中{lastZxid,id}最大的节点，但最集群不能保证
+//leader的lastCommitZxid是最高的，最终一致性一定要以客户端认为集群COMMIT成功为基础
+Set Timeout(FOLLOWINFO,T3); //leader选举后要设置一个接收followers注册的超时
+BEGIN_REISTER:
+	receive FOLLOWINFO(f.id, f.lastZxid, f.lastCommitZxid)
+		l.followers.add(<f.id, f.lastZxid, f.lastCommitZxid>);
+		if l.followers.size >= quorum
+			l.lastCommitZxid = Max(lastCommitZxid,l.ack_queue); //遍历找到最大lastCommitZxid
+			//根据f.id,f.lastZxid,l.lastCommmitZxid遍历followers发送同步消息
+			send SYNC(f,l.followers) // goto  RECOVEY.leader.BEGIN_SYNC
+END 
+
+BEGIN_TIMEOUT:
+	while trigger Timeout(FOLLOWINFO,T1)
+		goto LEADER_ELECTION
+END
+
+
+//恢复
+namespace RECOVEY;
+
+Set Follower as f;
+Set Leader as l;
+
+//code follower
+BEGIN_SYNC:
+send SYNC(f.id, f.lastZxid) to l;
+receive data from l;
+	if data == SYNC_DIFF({Start,End})
+		append to transaction log;
+		commit all //根据lastCommitZxid应用所有未提交的
+	if data == SYNC_TRUNC(zxid)
+		truncate transaction log from zxid
+	if data == SYNC_SNAP(MergerData)
+		separate transaction log and snapshot file; //sanpshot 和 tansaction log 都替换原文件
+		commit all	//根据lastCommitZxid应用所有未提交的
+	f.updated = true;
+END	
+
+//code leader
+BEGIN_SYNC:
+receive SYNC(id,lastZxid)
+	if lastZxid > l.lastCommitZxid //说明follower存在未提交的数据，且超过了leader
+		send SYNC_TRUNC(l.lastCommitZxid)
+	else if(lastZxid <= l.lastSnapshotZxid)
+		send SYNC_SNAP(l.mergerData)
+	else
+		send SYNC_DIFF({lastZxid,l.lastCommitZxid}) //发送这个之间的数据，不包括起点，包括终点 
+		
+END
+
+
+//广播
+namespace BROADCAST;
+
+//code client
+BEGIN_REQUEST:
+send REQUEST(Type,value) to a connected peer p;
+block wait ACK from p
+END
+
+BEGIN_RECEIVE_ACK_REQUEST:
+	receive ACK from follower f;//ACK：已提交；未通过；其他错误
+		Dosomething();
+		process go on
+END
+
+//code follower
+BEGIN_RECEIVE_REQUEST:
+receive REQUEST(Type,value) from client c;
+if Type = WRITE
+	send REQUEST(id,value) to leader
+else if (Type = READ)
+	Dosomething();
+	Ack(c)
+else if (Type = SYNC)
+	send SYNC(id, lastZxid) to l;
+	Dosomething() //not ack anything
+END
+
+BEGIN_RECEIVE_BROADCAST:
+	receive BROADCAST(<value,zxid>) from leader l;
+	Validate(zxid);
+	Append(<value,zxid>,history);//写入磁盘
+	send ACK_BROADCAST(id,<value,zxid>)
+END
+
+BEGIN_RECEIVE_ACK_REQUEST:
+	receive ACK_REQUEST(Any)
+		send ACK_REQUEST to client
+END
+
+BEGIN_RECEIVE_ACK_COMMIT:
+	receive COMMIT(<value,zxid>) from leader l;
+	Callback(COMMIT,<value,zxid>);  //回调提交接口
+	lastCommitZxid = zxid; //store to file
+END
+
+//code leader
+BEGIN_RECEIVE_REQUEST:
+receive REQUEST(id,value) from follower f;//先放入请求队列
+<value,zxid> = Format(value);
+Set Timeout(BROADCAST,T4);
+ack_queue = [];
+Append(<value,zxid>,history);//写入磁盘
+send BROADCAST(<value,zxid>) to all followers; //广播消息
+END
+
+BEGIN_RECEIVE_ACK_BROADCAST:
+	receive ACK_BROADCAST(id,<value,zxid>);
+	l.ack_queue.add(ACK_BROADCAST);
+	if l.ack_queue.size >= quorum
+		send COMMIT(<value,zxid>) to all followers；
+		lastCommitZxid = zxid; //store to file
+		ACK_REQUEST(<value,zxid>,COMMITED)
+END
+
+BEGIN_TIMEOUT:
+	while trigger Timeout(BROADCAST,T4);
+		ACK_REQUEST({UNCOMMIT,Reason})
+END
+	
+在这个过程中，leader不再是普通follower，它的一些状态改变都要先于其他followers；
+如果将leader的和本地的follower完全分开，将会导致lastCommitZxid和lastZxid对客户端不一致现象。
+在投票时，leader也具有follower的身份，可以参加投票。
+再广播时，leader不再只是普通follower，很多消息都本地处理，不用先通过发送接收消息的模式。
+
+
+回调
+1 回调提交
+Callback(COMMIT,<value,zxid>)
+2 回调快照
+Callback(SNAPSHOT,zxid)  //zxid <= lastCommitZxid
+
+
+
