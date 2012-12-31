@@ -12,11 +12,12 @@ var quorum  ;  //节点中的多数派大小
 var ack_queue; //节点的消息回收队列
 var timeout;   //等待超时
 var state;
-var lastCommitZxid; //最近一次提交的zxid
-var lastSnapshotZxid; //最近一次快照的zxid
+var lastCommitZxid; //最近一次提交的zxid，属于follower，持久化
+var tempCommitZxid; //leader临时记录集群最新的提交值，不持久化
+var logThreshold; //transaction log空间大小阈值，
 var leader;//   leader id
 var followers;// all followers
-var mergerData ; //将Transaction Log 和最新快照数据合并再一起的组合数据包
+var snapshot ; //快照数据(数据类型不关心)
 
 set Peer as p;
 BEGIN_INIT:
@@ -143,15 +144,23 @@ goto RECOVEY.follower.BEGIN_SYNC
 END
 
 //code leader
-//leader一定是可用集群中{lastZxid,id}最大的节点，但最集群不能保证
-//leader的lastCommitZxid是最高的，最终一致性一定要以客户端认为集群COMMIT成功为基础
+//leader一定是可用集群中{lastZxid,id}最大的节点，但集群不能保证
+//leader的lastCommitZxid是最高的，最终一致性一定要以客户端认为集群COMMIT成功
+//或集群认为已经通过多数派(crash后判断标准)
+//很多时候leader与本地的follower是共用变量，lastZxid、lastCommmitZxid一直是共有
 Set Timeout(FOLLOWINFO,T3); //leader选举后要设置一个接收followers注册的超时
 BEGIN_REISTER:
 	receive FOLLOWINFO(f.id, f.lastZxid, f.lastCommitZxid)
 		l.followers.add(<f.id, f.lastZxid, f.lastCommitZxid>);
 		if l.followers.size >= quorum
-			l.lastCommitZxid = Max(lastCommitZxid,l.ack_queue); //遍历找到最大lastCommitZxid
+			l.tempCommitZxid = Max(lastCommitZxid,l.ack_queue); //遍历找到最大lastCommitZxid
 			//根据f.id,f.lastZxid,l.lastCommmitZxid遍历followers发送同步消息
+			if	l.tempCommitZxid != l.lastZxid
+				//统计l.lastZxid是否存在多数派
+				if CountInclude(l.lastZxid,l.followers) >= quorum
+					l.tempCommitZxid = l.lastZxid
+			//本地follower先应用到tempCommitZxid点，方便后面快照得到最新数据。
+			Commit(follower，l.tempCommitZxid)
 			send SYNC(f,l.followers) // goto  RECOVEY.leader.BEGIN_SYNC
 END 
 
@@ -176,19 +185,19 @@ receive data from l;
 		commit all //根据lastCommitZxid应用所有未提交的
 	if data == SYNC_TRUNC(zxid)
 		truncate transaction log from zxid
-	if data == SYNC_SNAP(MergerData)
-		separate transaction log and snapshot file; //sanpshot 和 tansaction log 都替换原文件
-		commit all	//根据lastCommitZxid应用所有未提交的
+	if data == SYNC_SNAP(snapshot)
+		Replace(DATABASE,snapshot);//替换具体应用数据
+		commit all	//更新某些记录。
 	f.updated = true;
 END	
 
 //code leader
 BEGIN_SYNC:
 receive SYNC(id,lastZxid)
-	if lastZxid > l.lastCommitZxid //说明follower存在未提交的数据，且超过了leader
+	if lastZxid > l.lastCommitZxid //说明follower存在未通过多派的记录
 		send SYNC_TRUNC(l.lastCommitZxid)
-	else if(lastZxid <= l.lastSnapshotZxid)
-		send SYNC_SNAP(l.mergerData)
+	else if(lastZxid <= l.logThreshold)
+		send SYNC_SNAP(l.snapshot) 
 	else
 		send SYNC_DIFF({lastZxid,l.lastCommitZxid}) //发送这个之间的数据，不包括起点，包括终点 
 		
@@ -273,9 +282,9 @@ END
 
 回调
 1 回调提交
-Callback(COMMIT,<value,zxid>)
+Callback(COMMIT,<value,zxid>) ->{Tag,Value}
 2 回调快照
-Callback(SNAPSHOT,zxid)  //zxid <= lastCommitZxid
+Callback(SNAPSHOT,zxid)  ->{Tag,Value}//zxid = lastCommitZxid
 
 
 
